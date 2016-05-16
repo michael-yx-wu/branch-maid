@@ -107,7 +107,9 @@ def main
         end
     end
 
-    puts "\nRerun without '-n' or '--dry-run' to delete the above branches" if options[:dry_run]
+    if options[:dry_run] && !merged_branches.empty?
+        puts "\nRerun without '-n' or '--dry-run' to delete the above branches"
+    end
 end
 
 main if __FILE__ == $PROGRAM_NAME
