@@ -141,6 +141,13 @@ print_entry() {
     echo
 }
 
+# Prints "branch<tab>reason" lines in the same two columns as print_entry.
+print_report() {
+    printf '%s' "$1" | while IFS=$'\t' read -r branch reason; do
+        printf '  %-40s %s\n' "$branch" "$reason"
+    done
+}
+
 if [ "$FORCE" = false ]; then
     echo "Local branches with a merged PR in $repo:"
     total=0
@@ -163,15 +170,19 @@ errors=""
 skipped=""
 while IFS=$'\t' read -r branch title url; do
     if [ "$branch" = "$current_branch" ]; then
-        skipped="$skipped  $branch: currently checked out
+        skipped="$skipped$branch	currently checked out
 "
         continue
     fi
-    if git branch -D "$branch" >/dev/null 2>&1; then
+    # Keep git's own message. It says why -- unmerged, not found, in use by a
+    # worktree -- and "delete failed" does not. Folded onto one line so each
+    # branch stays one line in the summary.
+    if err=$(git branch -D "$branch" 2>&1 >/dev/null); then
         print_entry "$branch" "$title" "$url"
         total=$((total + 1))
     else
-        errors="$errors  $branch: delete failed
+        err=$(printf '%s' "$err" | tr '\n' ' ')
+        errors="$errors$branch	${err:-delete failed}
 "
     fi
 done <<EOF
@@ -183,11 +194,11 @@ echo "Total: $total"
 if [ -n "$errors" ]; then
     echo >&2
     echo "Errors:" >&2
-    printf '%s' "$errors" >&2
+    print_report "$errors" >&2
 fi
 
 if [ -n "$skipped" ]; then
     echo >&2
     echo "Skipped:" >&2
-    printf '%s' "$skipped" >&2
+    print_report "$skipped" >&2
 fi
