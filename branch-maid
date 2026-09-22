@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+#
+# Lists local branches that have a merged pull request on GitHub, and
+# optionally deletes them.
+#
+# Squash-merged branches look unmerged to git, so `git branch --merged` does
+# not find them. This asks GitHub instead, through the gh CLI. Pull request
+# records outlive the remote branch, so a deleted remote branch still counts.
+
+set -euo pipefail
+
+PROG=${0##*/}
+FORCE=false
+
+# Concurrent gh queries. High enough to hide latency on a few dozen branches,
+# low enough to stay clear of GitHub's secondary rate limits.
+JOBS=8
+
+# Printed per matching branch: PR title and url, tab separated.
+JQ_FILTER='.[0] | select(. != null) | "\(.title)\t\(.url)"'
+
+die() {
+    echo "$PROG: $*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<EOF
+Usage: $PROG [-f] [-h]
+
+Lists local branches whose pull request was merged on GitHub.
+
+  -f      delete merged branches (default is a dry run that only lists them)
+  -h      show usage
+EOF
+}
+
+while getopts ':fh' opt; do
+    case $opt in
+        f) FORCE=true ;;
+        h) usage; exit 0 ;;
+        :) die "-$OPTARG requires an argument" ;;
+        *) usage >&2; die "unknown option -$OPTARG" ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+command -v gh >/dev/null 2>&1 || die "gh is not installed"
+git rev-parse --git-dir >/dev/null 2>&1 || die "not a git repository"
+
+# gh only resolves a repo from the remote for hosts it already knows, so an
+# Enterprise remote needs GH_HOST. Read it off the remote here and pass it on
+# each gh call, rather than exporting it, so nobody has to keep a global
+# GH_HOST in sync with whichever repo they are standing in and nothing leaks
+# into the environment. Everything else -- owner, repo name -- gh works out
+# from the remote itself.
+remote_url=$(git remote get-url origin 2>/dev/null) || {
+    fallback=$(git remote | head -1)
+    [ -n "$fallback" ] || die "no git remote configured"
+    remote_url=$(git remote get-url "$fallback")
+}
+
+# Handles git@host:owner/repo.git, ssh://git@host:22/owner/repo.git and
+# https://user@host/owner/repo.git.
+host=$(printf '%s' "$remote_url" | sed -E '
+    s#^[a-zA-Z+]+://##
+    s/^[^@/]*@//
+    s#[:/].*##
+')
+case $host in
+    *[A-Za-z0-9]*) ;;
+    *) die "could not read a GitHub host out of '$remote_url'" ;;
+esac
+GH_HOST="$host" gh auth status --hostname "$host" >/dev/null 2>&1 \
+    || die "gh is not authenticated for $host; run: gh auth login --hostname $host"
+
+repo_info=$(GH_HOST="$host" gh repo view --json nameWithOwner,defaultBranchRef \
+    --jq '"\(.nameWithOwner)\t\(.defaultBranchRef.name)"') \
+    || die "could not resolve a repo on $host for this directory"
+repo=${repo_info%%	*}
+default_branch=${repo_info##*	}
+current_branch=$(git rev-parse --abbrev-ref HEAD)
+
+# Every local branch except the default one, which is never a merge candidate.
+candidates=$(git for-each-ref --format='%(refname:short)' refs/heads/ \
+    | grep -vxF "$default_branch" || true)
+
+if [ -z "$candidates" ]; then
+    echo "No branches to check in $repo."
+    exit 0
+fi
+
+results=$(mktemp)
+trap 'rm -f "$results"' EXIT
+
+# Looks up one branch and prints a tagged line:
+#   OK<tab>branch<tab>title<tab>url   a merged PR exists
+#   nothing                           no merged PR
+#   ERR<tab>branch                    the query itself failed
+# Keeping the two apart matters: a failed query must not read as "no PR", or
+# -f would delete branches that were never actually checked.
+#
+# Always returns 0. This runs as a child of xargs, which exits 123 if any
+# child exits nonzero, and that would trip set -e in the parent.
+query_branch() {
+    local filter=$1 host=$2 branch=$3 out
+    if out=$(GH_HOST="$host" gh pr list --head "$branch" --state merged \
+             --limit 1 --json title,url --jq "$filter" 2>/dev/null); then
+        if [ -n "$out" ]; then
+            printf 'OK\t%s\t%s\n' "$branch" "$out"
+        fi
+    else
+        printf 'ERR\t%s\n' "$branch"
+    fi
+    return 0
+}
+export -f query_branch
+
+# shellcheck disable=SC2016  # "$@" is for the child bash, not this shell
+printf '%s\n' "$candidates" \
+    | xargs -P "$JOBS" -I{} bash -c 'query_branch "$@"' _ \
+        "$JQ_FILTER" "$host" {} > "$results"
+
+failed=$(grep -c '^ERR' "$results" || true)
+if [ "$failed" -gt 0 ]; then
+    echo "$PROG: $failed branch queries failed:" >&2
+    sed -n 's/^ERR\t/  /p' "$results" >&2
+    die "refusing to continue while queries are failing"
+fi
+
+merged=$(sed -n 's/^OK\t//p' "$results" | sort)
+if [ -z "$merged" ]; then
+    echo "No local branches have a merged PR in $repo."
+    exit 0
+fi
+
+# Two lines per branch: title, then the PR link underneath it.
+print_entry() {
+    printf '  %-40s %s\n' "$1" "$2"
+    printf '  %-40s %s\n' "" "$3"
+    echo
+}
+
+if [ "$FORCE" = false ]; then
+    echo "Local branches with a merged PR in $repo:"
+    total=0
+    while IFS=$'\t' read -r branch title url; do
+        print_entry "$branch" "$title" "$url"
+        total=$((total + 1))
+    done <<EOF
+$merged
+EOF
+    echo "Total: $total"
+    echo "Rerun with -f to delete them."
+    exit 0
+fi
+
+# git branch -d refuses squash-merged branches, so delete with -D. The merged
+# PR is the safety check.
+echo "Deleted local branches with a merged PR in $repo:"
+total=0
+errors=""
+skipped=""
+while IFS=$'\t' read -r branch title url; do
+    if [ "$branch" = "$current_branch" ]; then
+        skipped="$skipped  $branch: currently checked out
+"
+        continue
+    fi
+    if git branch -D "$branch" >/dev/null 2>&1; then
+        print_entry "$branch" "$title" "$url"
+        total=$((total + 1))
+    else
+        errors="$errors  $branch: delete failed
+"
+    fi
+done <<EOF
+$merged
+EOF
+
+echo "Total: $total"
+
+if [ -n "$errors" ]; then
+    echo >&2
+    echo "Errors:" >&2
+    printf '%s' "$errors" >&2
+fi
+
+if [ -n "$skipped" ]; then
+    echo >&2
+    echo "Skipped:" >&2
+    printf '%s' "$skipped" >&2
+fi
